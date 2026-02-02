@@ -1,0 +1,17 @@
+# Ignore video source files
+*.ISO
+*.vob
+*.VOB
+*.mts
+*.MTS
+*.mkv
+*.mp4
+
+# Ignore generated images
+/data/*.png
+comparison_*
+
+# Ignore Docker build artifacts and Python cache
+__pycache__/
+*.pyc
+.DS_Store
