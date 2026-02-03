@@ -9,7 +9,7 @@ usage() {
     echo "==============================================================================="
     echo " VIDEO RECONSTRUCTION ENGINE - HELP"
     echo "==============================================================================="
-    echo "Usage: $0 <input_file> <time_or_frame> [count] [scale] [resizer] [fast] [mode] [tff]"
+    echo "Usage: $0 <input_file> <time_or_frame> [count] [scale] [resizer] [fast] [mode] [tff] [denoise]"
     echo ""
     echo "POSITIONAL PARAMETERS:"
     echo "  1. input_file      : Path to video (ISO, MKV, MP4, etc.)"
@@ -20,8 +20,15 @@ usage() {
     echo "  6. fast            : Set to 1 to skip QTGMC (fast test). Set to 0 for full quality."
     echo "  7. mode            : Output type: 'both' (comparison), 'prog' (original), 'int' (deinterlaced)."
     echo "  8. tff             : Field Order: 1 (Top Field First), 0 (Bottom), blank (Auto-detect)."
+    echo "  9. denoise         : none | light | medium | heavy (Default: medium)."
     echo ""
     echo "EXAMPLES:"
+    echo "  # Extract comparison with heavy denoising for grainy camcorder footage:"
+    echo "  $0 clip.mts 00:01:30.000 1 2 nnedi3_resample 0 both 1 heavy"
+    echo ""
+    echo "  # Standard DVD extraction (Auto-detect TFF/BFF, Medium denoise):"
+    echo "  $0 movie.iso 54644 1 1 bicubic 0 int"
+    echo ""
     echo "  # Extract a 2x Neural Upscaled comparison from a DVD frame:"
     echo "  $0 movie.iso 54644 1 2 nnedi3_resample 0 both"
     echo ""
@@ -31,6 +38,7 @@ usage() {
     exit 1
 }
 
+# Display help if requested or if minimum arguments are missing
 if [[ "$#" -lt 2 || "$1" == "--help" || "$1" == "-h" ]]; then usage; fi
 
 # Resolve absolute path for the input file
@@ -42,6 +50,7 @@ RESIZER="${5:-bicubic}"
 FAST_MODE="${6:-0}"
 MODE="${7:-both}"
 TFF_VAL="${8:-}"
+DENOISE="${9:-medium}"
 
 # Calculate absolute host path for the output directory
 DATA_DIR=$(dirname "$INPUT_FILE")
@@ -56,15 +65,14 @@ else
     EXTRA_ARGS="--frame $INPUT_VAL"
 fi
 
+# Apply optional flags
 if [ "$FAST_MODE" -eq 1 ]; then EXTRA_ARGS="$EXTRA_ARGS --fast"; fi
 if [ -n "$TFF_VAL" ]; then EXTRA_ARGS="$EXTRA_ARGS --tff $TFF_VAL"; fi
 
 FILENAME=$(basename "$INPUT_FILE")
 SCRIPT_DIR=$(pwd)
 
-
-
-
+# Execute the container
 docker run --rm \
     -v "$SCRIPT_DIR:/src" \
     -v "$DATA_DIR:/data" \
@@ -81,4 +89,5 @@ docker run --rm \
         --scale "$SCALE" \
         --resizer "$RESIZER" \
         --mode "$MODE" \
+        --denoise "$DENOISE" \
         $EXTRA_ARGS

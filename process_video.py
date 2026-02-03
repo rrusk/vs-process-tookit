@@ -1,6 +1,7 @@
 """
 Video Frame Extraction & Reconstruction Script
 Handles high-quality deinterlacing and upscaling with automatic metadata naming.
+Enhanced with Noise Reduction for camcorder footage and Host-aware path logging.
 """
 
 import argparse
@@ -15,6 +16,26 @@ import havsfunc as haf
 core = vs.core
 # Performance: Utilize all available CPU cores for motion analysis
 core.num_threads = os.cpu_count()
+
+def apply_noise_reduction(clip, strength="medium"):
+    """
+    Applies temporal noise reduction optimized for analog camcorder footage.
+    """
+    strength_map = {
+        "light": 1.0,
+        "medium": 2.0,
+        "heavy": 3.5
+    }
+    
+    sigma = strength_map.get(strength, 2.0)
+    
+    try:
+        # FFT3DFilter: Excellent for analog noise (VHS, Hi8, DV)
+        denoised = core.fft3dfilter.FFT3DFilter(clip, sigma=sigma, bt=3, bw=32, bh=32, ow=16, oh=16)
+        return denoised
+    except AttributeError:
+        print("Warning: fft3dfilter not available, skipping noise reduction")
+        return clip
 
 def apply_scaling(clip, target_scale, method):
     """
@@ -41,9 +62,9 @@ def apply_scaling(clip, target_scale, method):
 def process_frame(file_path, timestamp, output_dir, count=1, step=1,
                   fast=False, target_frame_num=None, scale=1,
                   resizer="bicubic", mode="both", tff_override=None, 
-                  host_dir=None, host_input=None):
+                  host_dir=None, host_input=None, denoise="medium"):
     """
-    Primary processing pipeline with Side-by-Side comparison and Command generation.
+    Primary processing pipeline with High-Quality QTGMC and Noise Reduction.
     """
     if not os.path.exists(file_path):
         print(f"Error: File {file_path} not found.")
@@ -76,13 +97,17 @@ def process_frame(file_path, timestamp, output_dir, count=1, step=1,
         tff = bool(tff_override)
         print(f"Using explicit Field Order: {'TFF' if tff else 'BFF'}")
     else:
-        # Check frame properties for field order
         sample_frame = video.get_frame(min(start_frame, video.num_frames - 1))
         prop_field = sample_frame.props.get('_FieldBased', 2) 
         tff = (prop_field != 1) 
         print(f"Detected Field Order: {'TFF' if tff else 'BFF'} (Source Prop: {prop_field})")
 
-    # --- Video Processing ---
+    # --- Noise Reduction (applied BEFORE deinterlacing) ---
+    if denoise and denoise != "none":
+        print(f"Applying {denoise} noise reduction...")
+        video = apply_noise_reduction(video, strength=denoise)
+
+    # --- Progressive Path ---
     video_prog = apply_scaling(video, scale, resizer)
     video_prog = core.resize.Bicubic(video_prog, format=vs.RGB24, matrix_in_s="709")
     prog_label = core.text.Text(video_prog, text=f"Original ({resizer} {scale}x)")
@@ -92,9 +117,21 @@ def process_frame(file_path, timestamp, output_dir, count=1, step=1,
     frame_multiplier = 1
     if mode in ["both", "int"] and not fast:
         try:
-            # High-quality motion-compensated deinterlacing
-            video_int = haf.QTGMC(video, Preset="Very Slow", TFF=tff)
-        except (AttributeError, TypeError):
+            print("Running QTGMC in High-Quality Interlaced Mode (InputType=0)...")
+            # RESTORED: InputType=0 is required for true deinterlacing of fields.
+            # RESTORED: Lossless=2 is compatible with InputType=0 and improves detail.
+            video_int = haf.QTGMC(
+                video, 
+                Preset="Very Slow", 
+                TFF=tff,
+                InputType=0,   
+                SourceMatch=3, 
+                Lossless=2,    
+                Border=True    
+            )
+            print("✓ High-quality deinterlacing complete")
+        except (AttributeError, TypeError) as e:
+            print(f"Warning: QTGMC 'Very Slow' failed ({e}), trying 'Slow' preset...")
             video_int = haf.QTGMC(video, Preset="Slow", TFF=tff)
 
         video_int = apply_scaling(video_int, scale, resizer)
@@ -108,13 +145,15 @@ def process_frame(file_path, timestamp, output_dir, count=1, step=1,
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
+    # Path translation for logging
     log_dir = host_dir if host_dir else output_dir
     input_ref = host_input if host_input else file_path
 
     # Build Re-run Commands
+    denoise_arg = f" {denoise}" if denoise != "medium" else ""
     base_cmd = f"./process_video.sh \"{input_ref}\" {frame_ref} {count} {scale} {resizer} {1 if fast else 0}"
-    cmd_prog = f"{base_cmd} prog"
-    cmd_int  = f"{base_cmd} int {1 if tff else 0}"
+    cmd_prog = f"{base_cmd} prog {1 if tff else ''}{denoise_arg}"
+    cmd_int  = f"{base_cmd} int {1 if tff else ''}{denoise_arg}"
 
     for i in range(count):
         current_target = start_frame + (i * step)
@@ -140,7 +179,10 @@ def process_frame(file_path, timestamp, output_dir, count=1, step=1,
 
         final_filename = out_name.replace('%d', '0')
         print(f"\n--- EXTRACTION COMPLETE ---")
-        print(f"FILE: {os.path.join(log_dir, final_filename)}")
+        if count == 1:
+            print(f"COMPLETE: {os.path.join(log_dir, final_filename)}")
+        else:
+            print(f"Saved: {final_filename} to {log_dir}")
         
         if mode == "both":
             print(f"\nTo extract ONLY your preferred version, run:")
@@ -164,8 +206,9 @@ if __name__ == "__main__":
     parser.add_argument("--mode", default="both", choices=["both", "prog", "int"], 
                         help="'both' = side-by-side comparison; 'prog' = source only; 'int' = deinterlaced only.")
     parser.add_argument("--tff", type=int, choices=[0, 1], help="Field order: 1 for Top Field First, 0 for Bottom. Leave blank for auto-detect.")
+    parser.add_argument("--denoise", default="medium", choices=["none", "light", "medium", "heavy"])
 
     args = parser.parse_args()
     process_frame(args.input, args.time, args.out, args.count, args.step, args.fast, 
                   args.frame, args.scale, args.resizer, args.mode, args.tff, 
-                  args.host_dir, args.host_input)
+                  args.host_dir, args.host_input, args.denoise)
