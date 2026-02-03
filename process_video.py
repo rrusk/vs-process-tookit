@@ -112,34 +112,54 @@ def process_frame(file_path, timestamp, output_dir, count=1, step=1,
     video_prog = core.resize.Bicubic(video_prog, format=vs.RGB24, matrix_in_s="709")
     prog_label = core.text.Text(video_prog, text=f"Original ({resizer} {scale}x)")
 
-    # --- Deinterlaced Path (QTGMC) ---
+    # --- Deinterlaced Path (Optimized for Still Extraction) ---
     video_int = None
+    qtgmc_fps_divisor = 2  # 2 = 1:1 frames, 1 = bob (double rate)
+    # frame_multiplier is now 1 because FPSDivisor=2 maintains original frame count
     frame_multiplier = 1
+
     if mode in ["both", "int"] and not fast:
         try:
-            print("Running QTGMC in High-Quality Interlaced Mode (InputType=0)...")
-            # RESTORED: InputType=0 is required for true deinterlacing of fields.
-            # RESTORED: Lossless=2 is compatible with InputType=0 and improves detail.
+            print("Running QTGMC with Scene-Aware Processing...")
+            # Best configuration for interlaced camcorder footage with scene changes:
+            # InputType=0: Pure interlaced (camcorders) - maintains quality
+            # FPSDivisor=2: Output same framerate as input (60i->30p, 50i->25p)
+            # SourceMatch=3: Helps with DVD authoring artifacts
+            # Lossless=2: Maximum detail preservation (compatible with InputType=0)
+            # 
+            # Scene change handling: QTGMC automatically detects scene changes
+            # via motion analysis - when motion vectors are inconsistent, it
+            # falls back to spatial interpolation for that frame.
             video_int = haf.QTGMC(
                 video, 
-                Preset="Very Slow", 
+                Preset="Very Slow",
                 TFF=tff,
-                InputType=0,   
-                SourceMatch=3, 
-                Lossless=2,    
-                Border=True    
+                InputType=0,                    # Pure interlaced - best quality
+                FPSDivisor=qtgmc_fps_divisor,   # Keeps original framerate if 2
+                SourceMatch=3,                  # DVD-optimized
+                Lossless=2,                     # Maximum detail
+                Border=True
             )
-            print("✓ High-quality deinterlacing complete")
+            print("✓ High-quality 1:1 deinterlacing complete")
         except (AttributeError, TypeError) as e:
             print(f"Warning: QTGMC 'Very Slow' failed ({e}), trying 'Slow' preset...")
-            video_int = haf.QTGMC(video, Preset="Slow", TFF=tff)
+            video_int = haf.QTGMC(video, Preset="Slow", TFF=tff, FPSDivisor=2)
 
         video_int = apply_scaling(video_int, scale, resizer)
         video_int = core.resize.Bicubic(video_int, format=vs.RGB24, matrix_in_s="709")
         int_label = core.text.Text(video_int, text=f"QTGMC Deint ({resizer} {scale}x)")
 
+    # Sanity check: FPSDivisor=2 should guarantee 1:1 frame mapping
+    if video_int and qtgmc_fps_divisor == 2:
+        assert video.fps == video_int.fps, (
+            f"FPS mismatch despite FPSDivisor=2 "
+            f"({video.fps} vs {video_int.fps})"
+        )
+
+    # Handle change in haf.QTGMC FPSDivisor setting (e.g. bob mode)
+    if video_int and qtgmc_fps_divisor != 2:
         fps_orig = video.fps.numerator / video.fps.denominator
-        fps_int = video_int.fps.numerator / video_int.fps.denominator
+        fps_int  = video_int.fps.numerator / video_int.fps.denominator
         frame_multiplier = 2 if fps_int > fps_orig * 1.5 else 1
 
     if not os.path.exists(output_dir):
@@ -162,6 +182,7 @@ def process_frame(file_path, timestamp, output_dir, count=1, step=1,
 
         out_name = ""
         if mode == "both" and video_int:
+            # target_int is now equal to current_target due to FPSDivisor=2
             target_int = current_target * frame_multiplier
             combined = core.std.StackHorizontal([prog_label[current_target], int_label[target_int]])
             out_name = f"{base_filename}_f{current_target:06d}_compare_{run_timestamp}_%d.png"
@@ -190,7 +211,7 @@ def process_frame(file_path, timestamp, output_dir, count=1, step=1,
             print(f" RIGHT (Deinterlaced): {cmd_int}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Video Reconstruction Engine: High-quality frame extraction.")
+    parser = argparse.ArgumentParser(description="Video Reconstruction Engine: High-quality 1:1 Still frame extraction.")
     parser.add_argument("--input", required=True, help="Path to source video (.ISO, .MKV, etc.)")
     parser.add_argument("--time", default="00:00:00.000", help="Timestamp (HH:MM:SS.mmm) for extraction.")
     parser.add_argument("--out", default="output", help="Internal container directory for writing.")
