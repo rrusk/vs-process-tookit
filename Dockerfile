@@ -130,6 +130,33 @@ RUN set -e && \
     # The plugin namespace 'eedi3m' is provided by libeedi3m.so
     cp -v build/libeedi3m.so /usr/lib/x86_64-linux-gnu/vapoursynth/ && \
     rm -rf /tmp/eedi3m
+
+# STEP 7.8: Build DePan (Required for Stabilization)
+RUN set -e && \
+    git clone https://github.com/Vapoursynth-Plugins-Gitify/DePan.git /tmp/depan && \
+    cd /tmp/depan && \
+    # Fix permission for the configure script
+    chmod +x configure && \
+    make -j$(nproc) && \
+    mkdir -p /usr/lib/x86_64-linux-gnu/vapoursynth && \
+    cp -v libdepan.so /usr/lib/x86_64-linux-gnu/vapoursynth/ && \
+    rm -rf /tmp/depan
+
+# STEP 7.9: Build TDM (Required for Combing Detection)
+RUN set -e && apt-get update && apt-get install -y cmake && \
+    git clone https://github.com/pinterf/TIVTC.git /tmp/tivtc && \
+    # The project root for CMake is TIVTC/src
+    cd /tmp/tivtc/src && \
+    cmake -B build -S . && \
+    cmake --build build -j$(nproc) && \
+    mkdir -p /usr/lib/x86_64-linux-gnu/vapoursynth && \
+    # Use find to locate the libraries to avoid "cannot stat" errors
+    find build -name "libtivtc.so" -exec cp -v {} /usr/lib/x86_64-linux-gnu/vapoursynth/ \; && \
+    find build -name "libtdeint.so" -exec cp -v {} /usr/lib/x86_64-linux-gnu/vapoursynth/ \; && \
+    # Note: If libtdm.so is not built, check if it's integrated into libtivtc.so 
+    # as TDM functions are part of the TIVTC package.
+    find build -name "libtdm.so" -exec cp -v {} /usr/lib/x86_64-linux-gnu/vapoursynth/ \; || true && \
+    rm -rf /tmp/tivtc
     
 RUN python3 - << 'EOF'
 import vapoursynth as vs
@@ -137,11 +164,18 @@ core = vs.core
 print("znedi3 present:", hasattr(core, "znedi3"))
 print("znedi3 funcs:", dir(core.znedi3) if hasattr(core, "znedi3") else "MISSING")
 EOF
-
-# STEP 8: Finalize Environment
+# STEP 8: Finalize Environment & Patch QTGMC for your specific DePan build
 RUN VS_DIR="/usr/lib/x86_64-linux-gnu/vapoursynth" && \
     ln -sf $(find /usr/lib -name "libffms2.so*" | head -n 1) $VS_DIR/libffms2.so && \
-    pip3 install numpy havsfunc git+https://github.com/HomeOfVapourSynthEvolution/mvsfunc.git
+    pip3 install numpy && \
+    pip3 install havsfunc vsutil --no-deps && \
+    pip3 install git+https://github.com/HomeOfVapourSynthEvolution/mvsfunc.git --no-deps && \
+    # PATCH: Map standard DePan names to your Gitify build names
+    HAVS_PATH=$(python3 -c "import havsfunc; print(havsfunc.__file__)") && \
+    sed -i 's/core.depan.Estimate/core.depan.DePanEstimate/g' "$HAVS_PATH" && \
+    sed -i 's/core.depan.Stabilize/core.depan.DePan/g' "$HAVS_PATH" && \
+    # PATCH: Map 'cutoff' to 'offset' for your specific DePan signature
+    sed -i 's/cutoff=/offset=/g' "$HAVS_PATH"
 
 WORKDIR /app
 CMD ["python3"]

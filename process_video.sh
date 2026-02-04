@@ -1,93 +1,97 @@
 #!/bin/bash
-# Intelligent wrapper for the Reconstruction Engine.
-# Handles Docker volume mounting, host path resolution, and parameter parsing.
+# ==============================================================================
+# VIDEO RECONSTRUCTION ENGINE - PRODUCTION WRAPPER
+# ==============================================================================
+# Dependency: docker, realpath
+# ==============================================================================
 
+set -e # Exit on error
+
+# --- Default Configuration ---
 IMAGE_NAME="video-reconstruction-engine"
-TAG="latest"
+COUNT=1
+SCALE=1
+RESIZER="nnedi3_resample"
+FAST=0
+MODE="composite"
+DENOISE="medium"
+STABILIZE=0
+TFF="" 
+
+# Dependency Check
+for cmd in docker realpath; do
+    if ! command -v "$cmd" &> /dev/null; then
+        echo "Error: Required dependency '$cmd' not found in PATH."
+        exit 1
+    fi
+done
 
 usage() {
-    echo "==============================================================================="
-    echo " VIDEO RECONSTRUCTION ENGINE - HELP"
-    echo "==============================================================================="
-    echo "Usage: $0 <input_file> <time_or_frame> [count] [scale] [resizer] [fast] [mode] [tff] [denoise]"
-    echo ""
-    echo "POSITIONAL PARAMETERS:"
-    echo "  1. input_file      : Path to video (ISO, MKV, MP4, etc.)"
-    echo "  2. time_or_frame   : Target point. Use '00:15:30.000' (time) OR '54644' (frame)."
-    echo "  3. count           : Number of sequential frames to extract (Default: 1)."
-    echo "  4. scale           : Integer multiplier for size (e.g., 2 for double size)."
-    echo "  5. resizer         : Method: 'bicubic' (fast), 'lanczos', or 'nnedi3_resample' (best quality)."
-    echo "  6. fast            : Set to 1 to skip QTGMC (fast test). Set to 0 for full quality."
-    echo "  7. mode            : Output type: 'both' (comparison), 'prog' (original), 'int' (deinterlaced)."
-    echo "  8. tff             : Field Order: 1 (Top Field First), 0 (Bottom), blank (Auto-detect)."
-    echo "  9. denoise         : none | light | medium | heavy (Default: medium)."
-    echo ""
-    echo "EXAMPLES:"
-    echo "  # Extract comparison with heavy denoising for grainy camcorder footage:"
-    echo "  $0 clip.mts 00:01:30.000 1 2 nnedi3_resample 0 both 1 heavy"
-    echo ""
-    echo "  # Standard DVD extraction (Auto-detect TFF/BFF, Medium denoise):"
-    echo "  $0 movie.iso 54644 1 1 bicubic 0 int"
-    echo ""
-    echo "  # Extract a 2x Neural Upscaled comparison from a DVD frame:"
-    echo "  $0 movie.iso 54644 1 2 nnedi3_resample 0 both"
-    echo ""
-    echo "  # Extract 10 original frames starting at 1 minute (no deinterlacing):"
-    echo "  $0 clip.mp4 00:01:00.000 10 1 bicubic 1 prog"
-    echo "==============================================================================="
+    cat << EOF
+Usage: $0 -i <input_path> -f <frame_or_timestamp> [options]
+
+Required:
+  -i  Input file path
+  -f  Frame number or timestamp (00:00:00.000)
+
+Options:
+  -m  Mode: composite (default), single, original, deint
+  -s  Scale: Integer multiplier (default: 1)
+  -x  Stabilize: 1 (on), 0 (off)
+  -t  TFF: 1 (Top), 0 (Bottom), Omit for Auto-detect
+  -z  Fast Mode: Set 1 to use Fast preset
+EOF
     exit 1
 }
 
-# Display help if requested or if minimum arguments are missing
-if [[ "$#" -lt 2 || "$1" == "--help" || "$1" == "-h" ]]; then usage; fi
+# --- Argument Parsing ---
+while getopts "i:f:c:s:r:m:d:x:t:z:h" opt; do
+    case $opt in
+        i) INPUT_FILE=$(realpath "$OPTARG") ;;
+        f) INPUT_VAL="$OPTARG" ;;
+        c) COUNT="$OPTARG" ;;
+        s) SCALE="$OPTARG" ;;
+        r) RESIZER="$OPTARG" ;;
+        m) MODE="$OPTARG" ;;
+        d) DENOISE="$OPTARG" ;;
+        x) STABILIZE="$OPTARG" ;;
+        t) TFF="$OPTARG" ;;
+        z) FAST="$OPTARG" ;;
+        h|*) usage ;;
+    esac
+done
 
-# Resolve absolute path for the input file
-INPUT_FILE=$(realpath "$1")
-INPUT_VAL="$2"
-COUNT="${3:-1}"
-SCALE="${4:-1}"
-RESIZER="${5:-bicubic}"
-FAST_MODE="${6:-0}"
-MODE="${7:-both}"
-TFF_VAL="${8:-}"
-DENOISE="${9:-medium}"
+if [[ -z "$INPUT_FILE" || -z "$INPUT_VAL" ]]; then usage; fi
 
-# Calculate absolute host path for the output directory
+# Path resolution
 DATA_DIR=$(dirname "$INPUT_FILE")
 OUT_DIR_HOST="$DATA_DIR/reconstructed"
 mkdir -p "$OUT_DIR_HOST"
-
-# Determine if input is a timestamp or frame number
-EXTRA_ARGS=""
-if [[ "$INPUT_VAL" == *":"* ]]; then
-    EXTRA_ARGS="--time $INPUT_VAL"
-else
-    EXTRA_ARGS="--frame $INPUT_VAL"
-fi
-
-# Apply optional flags
-if [ "$FAST_MODE" -eq 1 ]; then EXTRA_ARGS="$EXTRA_ARGS --fast"; fi
-if [ -n "$TFF_VAL" ]; then EXTRA_ARGS="$EXTRA_ARGS --tff $TFF_VAL"; fi
-
 FILENAME=$(basename "$INPUT_FILE")
-SCRIPT_DIR=$(pwd)
 
-# Execute the container
-docker run --rm \
-    -v "$SCRIPT_DIR:/src" \
+# Assemble Python Command Array for safe execution
+PY_CMD=(
+    python3 /src/process_video.py
+    --input "/data/$FILENAME"
+    --out "/data/reconstructed"
+    --host-dir "$OUT_DIR_HOST"
+    --host-input "$INPUT_FILE"
+    --count "$COUNT"
+    --scale "$SCALE"
+    --resizer "$RESIZER"
+    --mode "$MODE"
+    --denoise "$DENOISE"
+    --stabilize "$STABILIZE"
+)
+
+[[ "$INPUT_VAL" == *":"* ]] && PY_CMD+=(--time "$INPUT_VAL") || PY_CMD+=(--frame "$INPUT_VAL")
+[[ "$FAST" == "1" ]] && PY_CMD+=(--fast)
+[[ -n "$TFF" ]] && PY_CMD+=(--tff "$TFF")
+
+# --- Execute Container ---
+# Use exec to pass signals (Ctrl+C) directly to the containerized process
+exec docker run --rm \
+    -v "$(pwd):/src" \
     -v "$DATA_DIR:/data" \
     -u "$(id -u):$(id -g)" \
-    -e PYTHONPATH="/usr/lib/python3/dist-packages" \
-    -e VAPOURSYNTH_PLUGINS="/usr/lib/x86_64-linux-gnu/vapoursynth" \
-    "$IMAGE_NAME:$TAG" \
-    python3 /src/process_video.py \
-        --input "/data/$FILENAME" \
-        --out "/data/reconstructed" \
-        --host-dir "$OUT_DIR_HOST" \
-        --host-input "$INPUT_FILE" \
-        --count "$COUNT" \
-        --scale "$SCALE" \
-        --resizer "$RESIZER" \
-        --mode "$MODE" \
-        --denoise "$DENOISE" \
-        $EXTRA_ARGS
+    "$IMAGE_NAME:latest" "${PY_CMD[@]}"
