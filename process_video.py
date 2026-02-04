@@ -55,9 +55,10 @@ def detect_matrix(c: vs.VideoNode) -> str:
     Infers the correct color matrix based on frame resolution.
     
     Uses BT.601 for Standard Definition (SD) and BT.709 for High Definition (HD)
-    to prevent chroma shifts during RGB conversion.
+    to prevent chroma shifts during RGB conversion.  '170m' is the formal name
+    for BT.601/NTSC.
     """
-    return "709" if c.width >= 1280 else "601"
+    return "709" if c.width >= 1280 else "170m"
 
 
 def apply_stabilization(clip: vs.VideoNode, enable: bool) -> vs.VideoNode:
@@ -294,6 +295,17 @@ def process_frame(
             logger.info(f"Saved: {os.path.join(host_dir or output_dir, name.replace('%d','0'))}")
         except Exception as e:
             logger.error(f"Failed to write frame {idx}: {e}")
+
+    # --- Frame Discovery Guidance ---
+    if count > 1:
+        print("\n" + "-" * 60)
+        print("BATCH EXTRACTION COMPLETE - FRAME DISCOVERY")
+        print("-" * 60)
+        print(f"1. Open folder: {host_dir or output_dir}")
+        print("2. Audit frames visually to find the sharpest image.")
+        print("3. Note the index (e.g., _F054644_) in the filename.")
+        print("4. Re-run with -f <index> -m single for final archival.")
+        print("-" * 60)
 
     # Docker-Aware Suggestion Terminal Output
     if mode == "composite" and not fast:
