@@ -2,9 +2,10 @@
 """
 Video Frame Reconstruction & Quality Analysis Tool.
 
-This module provides a pipeline for high-quality video restoration using 
-VapourSynth. It supports incremental quality comparisons through a 
-2x2 composite grid.
+A high-quality VapourSynth pipeline specifically designed for archival camcorder 
+restoration. Supports field-aware deinterlacing, configurable noise reduction 
+stages (pre/post), global motion stabilization, and resolution-aware color 
+matrix detection.
 """
 
 import argparse
@@ -12,54 +13,63 @@ import datetime
 import logging
 import math
 import os
+import re
 import sys
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, Dict
 
 import havsfunc as haf
 import vapoursynth as vs
 
-# Configure professional logging
+# -----------------------------------------------------------------------------
+# Logging Configuration
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Initialize VapourSynth core
+# -----------------------------------------------------------------------------
+# VapourSynth Environment Initialization
+# -----------------------------------------------------------------------------
 core = vs.core
 core.num_threads = os.cpu_count()
 
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
 
 def to_pascal_case(text: str) -> str:
     """
-    Normalizes a string to PascalCase for CLI compatibility.
-
-    Args:
-        text: The input string containing spaces or underscores.
-
-    Returns:
-        A capitalized string with all whitespace removed.
+    Normalizes a filename to PascalCase for cross-platform CLI safety.
+    
+    Splits input on whitespace, underscores, or dashes to ensure robust
+    normalization regardless of source naming convention.
     """
-    return "".join(word.capitalize() for word in text.split())
+    parts = re.split(r"[\s_-]+", text)
+    return "".join(p.capitalize() for p in parts if p)
 
 
-def apply_stabilization(clip: vs.VideoNode, enable: bool = False) -> vs.VideoNode:
+def detect_matrix(c: vs.VideoNode) -> str:
     """
-    Applies global motion stabilization via DePan.
+    Infers the correct color matrix based on frame resolution.
+    
+    Uses BT.601 for Standard Definition (SD) and BT.709 for High Definition (HD)
+    to prevent chroma shifts during RGB conversion.
+    """
+    return "709" if c.width >= 1280 else "601"
 
-    Uses range=8 and trust=0.5 for family footage consistency.
 
-    Args:
-        clip: Input video node.
-        enable: Whether to apply the filter.
-
-    Returns:
-        Stabilized or original VideoNode.
+def apply_stabilization(clip: vs.VideoNode, enable: bool) -> vs.VideoNode:
+    """
+    Applies global motion stabilization via DePan internal estimator.
+    
+    Uses range=8 and trust=0.5 optimized for family camcorder footage.
     """
     if not enable:
         return clip
-    
     try:
+        logger.info("Applying global motion stabilization (DePan: range=8, trust=0.5)")
         mdata = core.depan.DePanEstimate(clip, range=8, trust=0.5)
         return core.depan.DePan(clip, data=mdata, offset=0.5, mirror=1)
     except Exception as e:
@@ -67,27 +77,21 @@ def apply_stabilization(clip: vs.VideoNode, enable: bool = False) -> vs.VideoNod
         return clip
 
 
-def apply_noise_reduction(clip: vs.VideoNode, strength: str = "medium") -> vs.VideoNode:
+def apply_noise_reduction(clip: vs.VideoNode, strength: str) -> vs.VideoNode:
     """
     Applies temporal noise reduction using FFT3DFilter.
-
-    Uses bt=4 for a larger temporal radius, optimized for stationary subjects.
-
-    Args:
-        clip: Input video node.
-        strength: Magnitude of denoising (light, medium, heavy).
-
-    Returns:
-        Denoised VideoNode.
+    
+    Uses bt=4 for a larger temporal radius, which provides better stability
+    for archival footage with consistent background noise.
     """
     strength_map: Dict[str, float] = {
         "none": 0.0, "light": 1.0, "medium": 2.0, "heavy": 3.5
     }
     sigma = strength_map.get(strength, 2.0)
-
+    
     if sigma == 0.0:
         return clip
-
+        
     try:
         return core.fft3dfilter.FFT3DFilter(
             clip, sigma=sigma, bt=4, bw=32, bh=32, ow=16, oh=16
@@ -96,198 +100,245 @@ def apply_noise_reduction(clip: vs.VideoNode, strength: str = "medium") -> vs.Vi
         logger.warning("FFT3DFilter plugin not found. Skipping denoise.")
         return clip
 
+# -----------------------------------------------------------------------------
+# Pipeline Assembly Logic
+# -----------------------------------------------------------------------------
 
 def get_output_node(
-    video: vs.VideoNode, 
-    mode: str, 
-    fast: bool, 
-    tff: bool, 
-    denoise: str, 
-    stabilize: bool, 
-    scale: int, 
-    resizer: str
+    video: vs.VideoNode,
+    mode: str,
+    fast: bool,
+    tff: bool,
+    denoise: str,
+    stabilize: bool,
+    scale: int,
+    resizer: str,
+    denoise_stage: str
 ) -> Tuple[vs.VideoNode, str, bool]:
     """
-    Assembles the VapourSynth processing graph based on requested mode.
-
+    Constructs the VapourSynth processing graph based on the requested mode.
+    
     Returns:
-        A tuple of (processed_node, filename_suffix, is_grid_mode).
+        A tuple containing (processed_node, filename_suffix, is_grid_mode).
     """
     v_raw = video
-    q_preset = "VerySlow" if not fast else "Fast"
+    
+    # Canonical Preset handling
+    q_preset_name = "Very Slow" if not fast else "Fast"
+    q_suffix = q_preset_name.replace(" ", "")
     field_str = "TFF" if tff else "BFF"
 
-    # Priority 1: De-interlace
+    # Stage 1: Optional PRE denoise (Improves QTGMC motion vectors)
+    if denoise_stage == "pre" and denoise != "none":
+        logger.info(f"Applying {denoise} noise reduction (PRE-deinterlacing stage)")
+        
+    v_prefilt = (
+        apply_noise_reduction(video, denoise) 
+        if denoise_stage == "pre" else video
+    )
+
+    # Stage 2: Deinterlacing (QTGMC with edge preservation)
+    # Border=True prevents artifacts at frame boundaries.
     v_deint = haf.QTGMC(
-        video, Preset="Very Slow" if not fast else "Fast",
-        TFF=tff, FPSDivisor=2, InputType=0,
-        SourceMatch=3, Lossless=2, ChromaMotion=True,
+        v_prefilt,
+        Preset=q_preset_name,
+        TFF=tff,
+        FPSDivisor=2,
+        InputType=0,
+        SourceMatch=3,
+        Lossless=2,
+        ChromaMotion=True,
         Border=True
     )
-    
-    # Priority 2: De-noise
-    v_denoised = apply_noise_reduction(v_deint, strength=denoise)
-    
-    # Priority 3: Stabilize
-    v_stab = apply_stabilization(v_denoised, enable=stabilize)
 
-    # Scale helper
+    # Stage 3: Optional POST denoise (Alternative for specific sources)
+    if denoise_stage == "post" and denoise != "none":
+        logger.info(f"Applying {denoise} noise reduction (POST-deinterlacing stage)")
+
+    v_dn = (
+        apply_noise_reduction(v_deint, denoise) 
+        if denoise_stage == "post" else v_deint
+    )
+
+    # Stage 4: Stabilization
+    v_stab = apply_stabilization(v_dn, stabilize)
+
+    # Scaling Logic Factory
     def scale_node(c: vs.VideoNode) -> vs.VideoNode:
         if scale == 1:
             return c
         w, h = c.width * scale, c.height * scale
+        logger.info(f"Scaling output to {w}x{h} using {resizer}")
         if resizer == "nnedi3_resample":
             c = core.znedi3.nnedi3(c, field=0, dh=True)
             c = core.std.Transpose(c)
             c = core.znedi3.nnedi3(c, field=0, dh=True)
             c = core.std.Transpose(c)
             return core.resize.Bicubic(c, width=w, height=h)
+        elif resizer == "lanczos":
+            return core.resize.Lanczos(c, width=w, height=h)
         return core.resize.Bicubic(c, width=w, height=h)
 
-    if mode == "composite" and not fast:
-        def prep(c: vs.VideoNode, lbl: str) -> vs.VideoNode:
-            c = scale_node(c)
-            c = core.resize.Bicubic(c, format=vs.RGB24, matrix_in_s="709")
-            return core.text.Text(c, lbl)
+    # 2x2 Composite Grid Generation
+    if mode == "composite":
+        if fast:
+            logger.warning("Composite grid mode is intentionally simplified when --fast is used.")
+        else:
+            def prep(c: vs.VideoNode, lbl: str) -> vs.VideoNode:
+                c = scale_node(c)
+                matrix = detect_matrix(c)
+                c = core.resize.Bicubic(c, format=vs.RGB24, matrix_in_s=matrix)
+                return core.text.Text(c, lbl)
 
-        q1 = prep(v_raw, f"1. ORIGINAL ({field_str})")
-        q2 = prep(v_deint, f"2. DE-INT (QTGMC: {q_preset}, {field_str})")
-        q3 = prep(v_denoised, f"3. DE-INT + DE-NOISE ({denoise.capitalize()}, Bt4, {field_str})")
-        q4 = prep(v_stab, f"4. ALL (+ STAB: R8, T0.5, {field_str})")
+            q1 = prep(v_raw, f"1. ORIGINAL ({field_str})")
+            q2 = prep(v_deint, f"2. DE-INT (QTGMC {q_preset_name}, {field_str})")
+            q3 = prep(v_dn, f"3. DE-INT + DN ({denoise}, {denoise_stage})")
+            q4 = prep(v_stab, f"4. ALL + STAB")
 
-        top = core.std.StackHorizontal([q1, q2])
-        bot = core.std.StackHorizontal([q3, q4])
-        return core.std.StackVertical([top, bot]), "PriorityGrid", True
+            top = core.std.StackHorizontal([q1, q2])
+            bot = core.std.StackHorizontal([q3, q4])
+            return core.std.StackVertical([top, bot]), "PriorityGrid", True
 
-    # Individual mode logic
+    # Individual Output Mode Mapping
     if mode == "original":
         node, suffix = v_raw, "Original"
     elif mode == "single":
         node = v_stab
-        comps = [f"Deint{q_preset}"]
+        parts = [f"Deint{q_suffix}"]
         if denoise != "none":
-            comps.append(f"Denoise{denoise.capitalize()}Bt4")
+            parts.append(f"DN{denoise.capitalize()}{denoise_stage.capitalize()}")
         if stabilize:
-            comps.append("StabR8T05")
-        suffix = "".join(comps)
+            parts.append("Stab")
+        suffix = "".join(parts)
     else:
-        node, suffix = v_deint, f"Deint{q_preset}"
+        node, suffix = v_deint, f"Deint{q_suffix}"
 
     node = scale_node(node)
-    return core.resize.Bicubic(node, format=vs.RGB24, matrix_in_s="709"), suffix, False
+    matrix = detect_matrix(node)
+    return core.resize.Bicubic(node, format=vs.RGB24, matrix_in_s=matrix), suffix, False
 
+# -----------------------------------------------------------------------------
+# Frame Extraction Loop
+# -----------------------------------------------------------------------------
 
 def process_frame(
-    file_path: str, 
-    timestamp: str, 
-    output_dir: str, 
-    count: int = 1, 
-    step: int = 1,
-    fast: bool = False, 
-    target_frame_num: Optional[int] = None, 
-    scale: int = 1,
-    resizer: str = "bicubic", 
-    mode: str = "composite", 
-    tff_override: Optional[int] = None,
-    denoise: str = "medium", 
-    stabilize: bool = False, 
-    host_input: Optional[str] = None,
-    host_dir: Optional[str] = None
+    file_path: str,
+    timestamp: str,
+    output_dir: str,
+    count: int,
+    step: int,
+    fast: bool,
+    target_frame_num: Optional[int],
+    scale: int,
+    resizer: str,
+    mode: str,
+    tff_override: Optional[int],
+    denoise: str,
+    stabilize: bool,
+    denoise_stage: str,
+    host_input: Optional[str],
+    host_dir: Optional[str]
 ) -> None:
-    """Core logic to extract and save processed frames."""
+    """Primary entry point for frame extraction and archival output."""
     if not os.path.exists(file_path):
-        logger.error(f"File not found: {file_path}")
+        logger.error(f"Source file not found: {file_path}")
         sys.exit(1)
 
-    try:
-        video = core.ffms2.Source(source=file_path)
-    except Exception as e:
-        logger.error(f"Failed to open source: {e}")
-        sys.exit(1)
-
+    video = core.ffms2.Source(source=file_path)
     base_fn = to_pascal_case(os.path.splitext(os.path.basename(file_path))[0])
     run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Indexing logic
+    # Target Frame Indexing Logic
     if target_frame_num is not None:
         start_frame = target_frame_num
     else:
         fps = video.fps.numerator / video.fps.denominator
         h, m, s = map(float, timestamp.split(':'))
-        start_frame = int(math.floor((h * 3600 + m * 60 + s) * fps + 0.5))
+        start_frame = int((h * 3600 + m * 60 + s) * fps + 0.5)
 
-    # Field Order Detection
+    # Field Order Detection with Transparency
     if tff_override is not None:
         tff = bool(tff_override)
     else:
         sample = video.get_frame(min(start_frame, video.num_frames - 1))
-        tff = (sample.props.get('_FieldBased', 2) != 1)
+        fb = sample.props.get('_FieldBased', 2)
+        if fb == 1:
+            tff = False
+            logger.info("Detected field order: BFF")
+        elif fb == 2:
+            tff = True
+            logger.info("Detected field order: TFF")
+        elif fb == 0:
+            logger.warning("Source is progressive (_FieldBased=0). Using TFF as default for QTGMC compatibility.")
+            tff = True
+        else:
+            logger.warning(f"Unknown _FieldBased value: {fb}. Defaulting to TFF.")
+            tff = True
 
     out_node, suffix, is_grid = get_output_node(
-        video, mode, fast, tff, denoise, stabilize, scale, resizer
+        video, mode, fast, tff, denoise, stabilize, scale, resizer, denoise_stage
     )
 
     os.makedirs(output_dir, exist_ok=True)
 
     for i in range(count):
-        curr_idx = start_frame + (i * step)
-        if curr_idx >= video.num_frames:
+        idx = start_frame + i * step
+        if idx >= video.num_frames:
             break
 
-        out_name = f"{base_fn}_F{curr_idx:06d}_{suffix}_{run_ts}_0.png"
-        write_path = os.path.join(output_dir, out_name.replace('_0.png', '_%d.png'))
+        name = f"{base_fn}_F{idx:06d}_{suffix}_{run_ts}_%d.png"
+        path = os.path.join(output_dir, name)
         
         try:
-            core.imwri.Write(out_node[curr_idx], "png", write_path).get_frame(0)
-            host_path = os.path.join(host_dir or output_dir, out_name)
-            logger.info(f"Saved: {host_path}")
+            core.imwri.Write(out_node[idx], "png", path).get_frame(0)
+            logger.info(f"Saved: {os.path.join(host_dir or output_dir, name.replace('%d','0'))}")
         except Exception as e:
-            logger.error(f"Failed to write frame {curr_idx}: {e}")
+            logger.error(f"Failed to write frame {idx}: {e}")
 
-    if mode == "composite":
-        print("\n" + "="*40 + "\n INDIVIDUAL EXTRACTION SUGGESTIONS\n" + "="*40)
+    # Docker-Aware Suggestion Terminal Output
+    if mode == "composite" and not fast:
+        print("\n" + "=" * 60)
+        print("COMPOSITE BREAKDOWN - INDIVIDUAL EXTRACTION COMMANDS")
+        print("=" * 60)
         u_in = host_input or file_path
-        f_o = int(tff)
-        cmd_base = f"./process_video.sh -i \"{u_in}\" -f {start_frame} -s {scale}"
+        f_val = target_frame_num if target_frame_num is not None else timestamp
+        tff_flag = "" if tff_override is None else f" -t {int(tff)}"
+        
+        base = f"./process_video.sh -i \"{u_in}\" -f \"{f_val}\" -s {scale} -r {resizer}"
+        print(f"1. ORIGINAL:  {base} -m original{tff_flag}")
+        print(f"2. DE-INT:    {base} -m deint -d none{tff_flag}")
+        print(f"3. DE-INT+DN: {base} -m single -d {denoise}{tff_flag}")
+        print(f"4. FULL PIPE: {base} -m single -d {denoise} -x 1{tff_flag}")
+        print("=" * 60)
 
-        # 1. Raw Interlaced Source
-        print(f"1. ORIGINAL:      {cmd_base} -m original -t {f_o}")
-
-        # 2. De-interlaced only (No Denoise, No Stab)
-        print(f"2. DE-INT ONLY:   {cmd_base} -m deint -t {f_o} -d none")
-
-        # 3. De-interlaced + De-noised (No Stab)
-        print(f"3. DE-INT + DN:   {cmd_base} -m single -t {f_o} -d {denoise} -x 0")
-
-        # 4. Full Suite (De-int + DN + Stab)
-        print(f"4. FULL SUITE:    {cmd_base} -m single -t {f_o} -d {denoise} -x 1")
-        print("="*40)
-
+# -----------------------------------------------------------------------------
+# Main CLI Execution
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Reconstruction Engine CLI")
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--time", default="00:00:00.000")
-    parser.add_argument("--out", default="output")
-    parser.add_argument("--host-dir")
-    parser.add_argument("--host-input")
-    parser.add_argument("--count", type=int, default=1)
-    parser.add_argument("--step", type=int, default=1)
-    parser.add_argument("--fast", action="store_true")
-    parser.add_argument("--frame", type=int)
-    parser.add_argument("--scale", type=int, default=1)
-    parser.add_argument("--resizer", default="bicubic")
-    parser.add_argument("--mode", default="composite")
-    parser.add_argument("--tff", type=int)
-    parser.add_argument("--denoise", default="medium")
-    parser.add_argument("--stabilize", type=int, default=0)
-    
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Professional Archival Reconstruction CLI")
+    p.add_argument("--input", required=True)
+    p.add_argument("--time", default="00:00:00.000")
+    p.add_argument("--out", default="output")
+    p.add_argument("--host-dir")
+    p.add_argument("--host-input")
+    p.add_argument("--count", type=int, default=1)
+    p.add_argument("--step", type=int, default=1)
+    p.add_argument("--fast", action="store_true")
+    p.add_argument("--frame", type=int)
+    p.add_argument("--scale", type=int, default=1)
+    p.add_argument("--resizer", default="bicubic", choices=["bicubic", "lanczos", "nnedi3_resample"])
+    p.add_argument("--mode", default="composite", choices=["composite", "original", "single", "deint"])
+    p.add_argument("--tff", type=int, choices=[0, 1])
+    p.add_argument("--denoise", default="medium", choices=["none", "light", "medium", "heavy"])
+    p.add_argument("--denoise-stage", default="pre", choices=["pre", "post"])
+    p.add_argument("--stabilize", type=int, default=0)
+
+    a = p.parse_args()
 
     process_frame(
-        file_path=args.input, timestamp=args.time, output_dir=args.out,
-        count=args.count, step=args.step, fast=args.fast,
-        target_frame_num=args.frame, scale=args.scale, resizer=args.resizer,
-        mode=args.mode, tff_override=args.tff, denoise=args.denoise,
-        stabilize=bool(args.stabilize), host_input=args.host_input,
-        host_dir=args.host_dir
+        file_path=a.input, timestamp=a.time, output_dir=a.out,
+        count=a.count, step=a.step, fast=a.fast, target_frame_num=a.frame,
+        scale=a.scale, resizer=a.resizer, mode=a.mode, tff_override=a.tff,
+        denoise=a.denoise, stabilize=bool(a.stabilize), denoise_stage=a.denoise_stage,
+        host_input=a.host_input, host_dir=a.host_dir
     )
